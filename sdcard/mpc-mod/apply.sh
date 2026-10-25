@@ -29,6 +29,39 @@ MAX_FAILS=2                           # after this many bad attempts, stop tryin
 log() { echo "[mpc-mod] $*"; }
 die() { echo "[mpc-mod] ERROR: $*" >&2; exit 1; }
 
+# The device image has openssl and no base64 applet.
+decode_b64() {
+    if command -v base64 >/dev/null 2>&1; then
+        printf '%s' "$1" | base64 -d > "$2"
+    else
+        printf '%s' "$1" | openssl base64 -d -A > "$2"
+    fi
+}
+
+# ---- preconditions ---------------------------------------------------------
+[ -r "$STOCK" ]      || die "cannot read stock binary: $STOCK"
+[ -r "$PATCH_LIST" ] || die "missing $PATCH_LIST (run: mpcpatch.py emit-device)"
+command -v sha256sum >/dev/null 2>&1 || die "sha256sum not found"
+if ! command -v base64 >/dev/null 2>&1 && ! command -v openssl >/dev/null 2>&1; then
+    die "base64 or openssl is required"
+fi
+
+TARGET_SHA=$(grep '^#target-sha256 ' "$PATCH_LIST" | cut -d' ' -f2)
+RESULT_SHA=$(grep '^#result-sha256 ' "$PATCH_LIST" | cut -d' ' -f2)
+[ -n "$TARGET_SHA" ] || die "patch list has no #target-sha256"
+STOCK_SHA=$(sha256sum "$STOCK" | cut -d' ' -f1)
+
+# A second run in the same boot sees the patched file through the bind-mount.
+# That is success, not a new attempt, and must not burn a crash-guard strike.
+if [ -n "$RESULT_SHA" ] && [ "$RESULT_SHA" != "$TARGET_SHA" ] && [ "$STOCK_SHA" = "$RESULT_SHA" ]; then
+    log "patched stock OS is already mounted"
+    exit 0
+fi
+if [ "$STOCK_SHA" != "$TARGET_SHA" ]; then
+    die "stock sha256 $STOCK_SHA != target $TARGET_SHA - wrong firmware, refusing."
+fi
+log "stock binary verified against target"
+
 # ---- crash guard -----------------------------------------------------------
 # If .pending exists, a previous run started but never cleared it (crash / bad
 # patch / power loss). Count strikes; once we hit MAX_FAILS, refuse and leave
@@ -41,23 +74,6 @@ if [ "$fails" -ge "$MAX_FAILS" ]; then
 fi
 echo $((fails + 1)) > "$PENDING"
 
-# ---- preconditions ---------------------------------------------------------
-[ -r "$STOCK" ]      || die "cannot read stock binary: $STOCK"
-[ -r "$PATCH_LIST" ] || die "missing $PATCH_LIST (run: mpcpatch.py emit-device)"
-command -v sha256sum >/dev/null 2>&1 || die "sha256sum not found"
-command -v base64    >/dev/null 2>&1 || die "base64 not found"
-
-TARGET_SHA=$(grep '^#target-sha256 ' "$PATCH_LIST" | cut -d' ' -f2)
-RESULT_SHA=$(grep '^#result-sha256 ' "$PATCH_LIST" | cut -d' ' -f2)
-[ -n "$TARGET_SHA" ] || die "patch list has no #target-sha256"
-
-# ---- verify stock ----------------------------------------------------------
-STOCK_SHA=$(sha256sum "$STOCK" | cut -d' ' -f1)
-if [ "$STOCK_SHA" != "$TARGET_SHA" ]; then
-    die "stock sha256 $STOCK_SHA != target $TARGET_SHA - wrong firmware, refusing."
-fi
-log "stock binary verified against target"
-
 # ---- build patched copy in RAM --------------------------------------------
 rm -rf "$WORK"; mkdir -p "$WORK"
 cp "$STOCK" "$OUT"
@@ -66,9 +82,10 @@ cp "$STOCK" "$OUT"
 # Line format: "offset_decimal base64(original) base64(patched)".
 while read -r off b64o b64p; do
     case "$off" in ''|\#*) continue ;; esac   # skip blanks and header comments
-    printf '%s' "$b64o" | base64 -d > "$WORK/orig.bin"
-    printf '%s' "$b64p" | base64 -d > "$WORK/new.bin"
+    decode_b64 "$b64o" "$WORK/orig.bin"
+    decode_b64 "$b64p" "$WORK/new.bin"
     len=$(wc -c < "$WORK/new.bin")
+    len=${len##* }
     cur=$(dd if="$OUT" bs=1 skip="$off" count="$len" 2>/dev/null | sha256sum | cut -d' ' -f1)
     exp=$(sha256sum "$WORK/orig.bin" | cut -d' ' -f1)
     [ "$cur" = "$exp" ] || die "patch at offset $off: bytes do not match 'original'"
@@ -106,6 +123,14 @@ mount --bind "$OUT" "$STOCK" || die "bind-mount failed (need root). Nothing chan
 # log done first, then restart.
 rm -f "$PENDING"
 log "done. Reboot (or run rollback.sh) to return to stock."
+
+# autorun.sh sets this when it is about to start mpc-boot-thingy. Boot thingy
+# stops ac50 itself, and choosing Stock starts ac50 again, which then runs the
+# bind-mounted binary. Restarting here would race that handoff.
+if [ "${MPC_NO_RESTART:-}" = 1 ]; then
+    log "bind-mount is in place; not restarting ac50"
+    exit 0
+fi
 
 # Kick the app so it re-execs through the bind-mounted path. Best-effort: by now
 # activation is already complete and logged, so it is fine if this does not return

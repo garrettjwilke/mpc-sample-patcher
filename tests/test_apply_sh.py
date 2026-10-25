@@ -119,6 +119,32 @@ def test_apply_sh_clears_pending_before_restart(tmp_path):
     assert not (sd / ".pending").exists()
 
 
+def test_apply_sh_skips_restart_when_asked(tmp_path):
+    # Boot thingy's autorun sets this so the bind happens before the menu, and
+    # ac50 is left for boot thingy to stop and for Stock to start again.
+    proc, sd, work, stock, events = _run_apply(tmp_path)
+    assert proc.returncode == 0
+    env = dict(os.environ)
+    binsh = sd.parent.parent / "bin"
+    env["PATH"] = f"{binsh}{os.pathsep}" + env.get("PATH", "")
+    env["MPC_STOCK"] = str(stock)
+    env["MPC_WORK"] = str(tmp_path / "work-norestart")
+    env["MPC_NO_RESTART"] = "1"
+    events.write_text("")
+    before = stock.read_bytes()
+    proc2 = subprocess.run(
+        ["sh", str(sd / "apply.sh")],
+        env=env, capture_output=True, text=True,
+    )
+    assert proc2.returncode == 0, f"stdout={proc2.stdout!r} stderr={proc2.stderr!r}"
+    log = events.read_text()
+    assert "mount --bind" in log
+    assert "systemctl restart ac50.service" not in log
+    assert not (sd / ".pending").exists()
+    assert stock.read_bytes() == before
+    assert (tmp_path / "work-norestart" / "MPC-Sample-patched").read_bytes() == stock.read_bytes()
+
+
 def test_apply_sh_crash_guard_refuses_after_max_fails(tmp_path):
     # A stuck .pending at/above MAX_FAILS makes apply.sh refuse and leave stock.
     proc, sd, work, stock, events = _run_apply(tmp_path)
